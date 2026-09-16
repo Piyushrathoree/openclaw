@@ -445,6 +445,9 @@ describe("formatCompactCount", () => {
     [999_500, "1m"],
     [999_999, "1m"],
     [2_500_000, "2.5m"],
+    [999_499_999, "999m"],
+    [999_500_000, "1b"],
+    [2_500_000_000, "2.5b"],
   ])("formats %s as %s", (value, expected) => {
     expect(formatCompactCount(value)).toBe(expected);
   });

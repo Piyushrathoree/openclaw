@@ -142,21 +142,26 @@ function renderCatalogIcon(
   )}`;
 }
 
+function formatCompactUnit(value: number): number {
+  return value >= 100 ? Math.round(value) : Number(value.toFixed(1));
+}
+
 export function formatCompactCount(value: number): string {
   if (value < 1_000) {
     return new Intl.NumberFormat().format(value);
   }
-  if (value < 1_000_000) {
-    const thousands = value / 1_000;
-    const rounded = thousands >= 100 ? Math.round(thousands) : Number(thousands.toFixed(1));
-    // Values from 999,500 upward round to 1000 at thousands precision; roll
-    // over to the millions branch instead of displaying "1000k".
+  // Round before choosing the suffix: values such as 999,500 round to 1000 at
+  // the current tier and must roll over to the next one instead of "1000k".
+  for (const [divisor, suffix] of [
+    [1_000, "k"],
+    [1_000_000, "m"],
+  ] as const) {
+    const rounded = formatCompactUnit(value / divisor);
     if (rounded < 1_000) {
-      return `${rounded}k`;
+      return `${rounded}${suffix}`;
     }
   }
-  const millions = value / 1_000_000;
-  return `${millions >= 100 ? Math.round(millions) : Number(millions.toFixed(1))}m`;
+  return `${formatCompactUnit(value / 1_000_000_000)}b`;
 }
 
 function renderCatalogCard(
