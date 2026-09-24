@@ -4,9 +4,11 @@ import { createCatalogIoCounters } from "./session-catalog.performance-counters.
 import type { HeapProfiler, Profiler } from "node:inspector";
 import { Session as InspectorSession } from "node:inspector/promises";
 import { expect, it } from "vitest";
-import type { SessionsCatalogListParams } from "../../../packages/gateway-protocol/src/index.js";
+import type {
+  SessionCatalogHost,
+  SessionsCatalogListParams,
+} from "../../../packages/gateway-protocol/src/index.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
-import { retainSessionListForegroundWork } from "../session-projection-work.js";
 import { createComposedCatalogFixture } from "./session-catalog.performance.test-support.js";
 
 function measureHostCpuReference(): number {
@@ -63,7 +65,6 @@ it("measures 100 composed catalog lists against real session and plugin stores",
     async (state) => {
       const counters = createCatalogIoCounters();
       let fixture: Awaited<ReturnType<typeof createComposedCatalogFixture>> | undefined;
-      let releaseForeground: (() => void) | undefined;
       try {
         counters.begin();
         fixture = await createComposedCatalogFixture(state, counters);
@@ -124,20 +125,24 @@ it("measures 100 composed catalog lists against real session and plugin stores",
             limitPerHost: 32,
           },
         ];
+        const warmResponses: SessionCatalogHost[] = [];
         for (const query of variants) {
           for (let warm = 0; warm < 3; warm++) {
-            await fixture.list(query);
+            const result = await fixture.list(query);
+            if (warm === 2) {
+              warmResponses.push(result);
+            }
           }
         }
         do {
           await fixture.projection.ensureMaterialized();
         } while (fixture.projection.needsMaterialization);
         const cpuReferenceP50Ms = measureHostCpuReference();
-        // Keep optional transcript backfill out of the measured foreground work.
-        releaseForeground = retainSessionListForegroundWork();
+        expect(fixture.setupMaintenance).toEqual({ started: 3, completed: 3 });
         counters.begin();
         const durations: number[] = [];
         const workPerList = [];
+        const measuredResponses: SessionCatalogHost[] = [];
         let previousIo = counters.snapshot();
         let minimumRows = Infinity;
         const cpuStart = process.threadCpuUsage();
@@ -145,9 +150,11 @@ it("measures 100 composed catalog lists against real session and plugin stores",
           const started = performance.now();
           const result = await fixture.list(variants[index % variants.length]);
           durations.push(performance.now() - started);
+          measuredResponses.push(result);
           const currentIo = counters.snapshot();
           workPerList.push({
             sqliteReadCalls: currentIo.sqliteReadCalls - previousIo.sqliteReadCalls,
+            sqliteFreshnessReads: currentIo.sqliteFreshnessReads - previousIo.sqliteFreshnessReads,
             bindingAuthorityReads:
               currentIo.bindingAuthorityReads - previousIo.bindingAuthorityReads,
             pluginStateWorkerOperations:
@@ -158,10 +165,14 @@ it("measures 100 composed catalog lists against real session and plugin stores",
         }
         const cpu = process.threadCpuUsage(cpuStart);
         const io = counters.end();
+        for (const [index, result] of measuredResponses.entries()) {
+          expect(result).toEqual(warmResponses[index % variants.length]);
+        }
         expect(minimumRows).toBeGreaterThan(0);
         durations.sort((a, b) => a - b);
 
         const inspector = new InspectorSession();
+        expect(fixture.setupMaintenance).toEqual({ started: 3, completed: 3 });
         inspector.connect();
         let sampledAllocationBytes: number;
         let cpuSamples: ReturnType<typeof observedCpuSamples>;
@@ -201,6 +212,7 @@ it("measures 100 composed catalog lists against real session and plugin stores",
               "Separate 100-list pass with CPU and heap sampling. Counts are observed self samples; zero samples cannot exclude calls shorter than the sampling interval.",
             setupIo,
             ioTotals: io,
+            workPerList,
             ioPerList: Object.fromEntries(
               Object.entries(io).map(([key, value]) => [key, value / 100]),
             ),
@@ -217,11 +229,13 @@ it("measures 100 composed catalog lists against real session and plugin stores",
         expect(io.pluginStateWorkerReadOperations).toBe(0);
         expect(io.sessionEntryReads).toBe(0);
         expect(io.sessionPayloadReads).toBe(0);
-        // Revalidate all three adopted bindings without adding work to the resident list path.
+        // Cached-handle and reused-read admission each check published/content freshness.
+        // The adopted cohort still shares one bulk binding query without rescanning rows.
         for (const work of workPerList) {
           expect(work).toEqual({
-            sqliteReadCalls: 18,
-            bindingAuthorityReads: 3,
+            sqliteReadCalls: 5,
+            sqliteFreshnessReads: 4,
+            bindingAuthorityReads: 1,
             pluginStateWorkerOperations: 0,
           });
         }
@@ -231,7 +245,6 @@ it("measures 100 composed catalog lists against real session and plugin stores",
         // composition CPU growth leaves exact SQL budgets green.
         expect(durations[49]).toBeLessThan(cpuReferenceP50Ms * 20);
       } finally {
-        releaseForeground?.();
         try {
           await fixture?.close();
         } finally {
