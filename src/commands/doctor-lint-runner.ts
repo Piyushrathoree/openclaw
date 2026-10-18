@@ -202,14 +202,11 @@ async function prepareDoctorLintExecution(
       cleanupWarnings,
       onChecksComplete,
     );
-  // Full reports share private source bytes. Selected checks retain on-demand inspection.
-  if (opts.onlyIds?.length) {
-    return await run();
-  }
   let execution: DoctorLintExecution | undefined;
   try {
     return await withOpenClawStateDatabaseReadSnapshot(async () => (execution = await run()), {
       env: sourceEnv,
+      lazy: Boolean(opts.onlyIds?.length),
     });
   } catch (error) {
     if (!execution || !cleanupWarnings || !(error instanceof SqliteSnapshotCleanupError)) {
@@ -483,6 +480,9 @@ async function executeDoctorLint(
           : finding,
       )
     : detectedFindings;
+  const databaseStores = findings.flatMap((finding) =>
+    finding.checkId === "core/doctor/database-engine" && finding.details ? [finding.details] : [],
+  );
   const visible = findings.filter((finding) => healthFindingMeetsSeverity(finding, sevMin));
   const warnings = findings.filter(
     (finding) =>
@@ -496,6 +496,7 @@ async function executeDoctorLint(
     checksSkipped: result.checksSkipped,
     exitCode,
     findings: visible,
+    databaseStores,
     warnings,
     cleanupWarnings: stateView.cleanupWarnings,
     writeOutput() {
@@ -505,6 +506,7 @@ async function executeDoctorLint(
           checksRun: result.checksRun,
           checksSkipped: result.checksSkipped,
           findings: visible,
+          databaseStores: databaseStores.length ? databaseStores : undefined,
           // Ordinary reports include settled cleanup warnings; rehearsal workers report before disposal.
           warnings: [...warnings, ...(stateView.cleanupWarnings ?? [])],
         });
@@ -536,10 +538,10 @@ async function withReadOnlyPluginStateSnapshot<T>(
   cleanupWarnings?: HealthFinding[],
 ): Promise<T> {
   const sourceDatabasePath = resolveOpenClawStateSqlitePath(sourceEnv);
-  const captureStorage = Object.freeze({
+  const captureStorage = {
     stateDir: getPluginSourceCaptureStorage()?.stateDir ?? resolveStateDir(sourceEnv),
     placement: "temporary" as const,
-  });
+  };
   let cleanup: () => Promise<boolean>;
   let privateRoot: string;
   let prepared: ReturnType<typeof prepareSqliteReadOnlyLocationSync> | undefined;
